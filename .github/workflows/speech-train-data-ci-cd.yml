@@ -108,7 +108,7 @@ jobs:
     needs: setup
 
     steps:
-      - name: Checkout and download LFS dependencies
+      - name: Checkout the repository
         uses: actions/checkout@v2
         with:
           # Indicates all history.
@@ -165,8 +165,8 @@ jobs:
       # Upload training data and create the Custom Speech model.
       #########################################################################
 
-      # Assemble the Audio + Human-Labeled Transcript in the proper format to
-      # then upload the data.
+      # Assemble the Audio + Human-Labeled Transcript in the proper format and
+      # upload the data.
       #
       # Check that the data has been successfully uploaded with
       # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
@@ -259,14 +259,8 @@ jobs:
       # errors. Not all training data will be used, so check that it was with
       # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
       # the variable is a valid GUID with 32 hexadecimal characters.
-      - name: Delete datasets
+      - name: Delete training datasets
         run: |
-          audio_trans_test_id=${{ env.AUDIO_TRANS_TEST_ID }}
-          if [[ ${audio_trans_test_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
-          then
-            speech dataset delete ${{ env.AUDIO_TRANS_TEST_ID }}
-            echo DELETED AUDIO+HUMAN-LABELED TRANSCRIPT TESTING DATA.
-          fi
           audio_trans_train_id=${{ env.AUDIO_TRANS_TRAIN_ID }}
           if [[ ${audio_trans_train_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
           then
@@ -327,12 +321,17 @@ jobs:
         run: |
           speech test create -n test_from_train_data_update_${{ env.CURRENT_COMMIT_HASH }} -a ${{ env.AUDIO_TRANS_TEST_ID }} -m ${{ env.CUSTOM_SPEECH_MODEL_ID }} -lm ${{ env.CUSTOM_SPEECH_MODEL_ID }} --wait > ${{ env.TEST_BUILD_FOLDER_PATH }}/test-output.txt
           test_id=$(cat ${{ env.TEST_BUILD_FOLDER_PATH }}/test-output.txt | sed -n '3p')
-          echo "::set-env name=TEST_ID::$(echo $test_id)"
           if ! [[ ${test_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
           then
             echo "::error ::Failed to test the Custom Speech model. Possibly re-run all jobs."
             exit 1
           fi
+          echo "::set-env name=TEST_ID::$(echo $test_id)"
+
+      - name: Delete testing datasets
+        run: |
+          speech dataset delete ${{ env.AUDIO_TRANS_TEST_ID }}
+          echo DELETED AUDIO+HUMAN-LABELED TRANSCRIPT TESTING DATA.
 
       # Get the content from the test and remove the first line, which is
       # logging, so the result is a JSON file.
@@ -342,19 +341,6 @@ jobs:
           echo "::set-env name=TEST_SUMMARY_FILE::$(echo $test_summary_file_name)"
           speech test show ${{ env.TEST_ID }} > ${{ env.TEST_BUILD_FOLDER_PATH }}/$test_summary_file_name
           sed -i '1d' ${{ env.TEST_BUILD_FOLDER_PATH }}/$test_summary_file_name
-
-      # Set environment variables to be bash variables to avoid substitution
-      # errors. Check that the test has been successfully uploaded with
-      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
-      # the variable is a valid GUID with 32 hexadecimal characters.
-      - name: Delete test
-        run: |
-          test_id=${{ env.TEST_ID }}
-          if [[ ${test_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
-          then
-            speech test delete ${{ env.TEST_ID }}
-            echo "TEST DELETED"
-          fi
 
       ###########################################################################
       # Archiving test results in blob
@@ -377,13 +363,20 @@ jobs:
           curl $results_url -o "test-results.txt"
           az storage blob upload --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --container-name test-results --name test-results-from-train-data-update-${{ env.CURRENT_COMMIT_HASH }}.txt --file test-results.txt --auth-mode login
 
+      # Delete the test. This must be done after the test results file is
+      # generated, as the resultsUrl will only be available while the test
+      # exists.
+      - name: Delete test
+        run: |
+          speech test delete ${{ env.TEST_ID }}
+          echo DELETED TEST.
+
       ###########################################################################
       # FAIL pipeline and delete assets in Speech Studio if WER did not improve.
       ###########################################################################
 
       - name: Verify the configuration file exists
-        run: |
-          az storage blob exists --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --container-name configuration --name benchmark-test.txt --auth-mode login | jq '.exists' | xargs -I {} echo "::set-env name=BENCHMARK_BLOB_EXISTS::{}"
+        run: az storage blob exists --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --container-name configuration --name benchmark-test.txt --auth-mode login | jq '.exists' | xargs -I {} echo "::set-env name=BENCHMARK_BLOB_EXISTS::{}"
 
       - name: Get the benchmark word error rate (WER)
         if: env.BENCHMARK_BLOB_EXISTS == 'true'
@@ -396,8 +389,7 @@ jobs:
       # Get NEW_WER from the newly-created test results file.
       - name: Get the new word error rate (WER)
         if: env.BENCHMARK_BLOB_EXISTS == 'true'
-        run: |
-          jq '.wordErrorRate' ${{ env.TEST_BUILD_FOLDER_PATH }}/${{ env.TEST_SUMMARY_FILE }} | xargs -I {} echo "::set-env name=NEW_WER::{}"
+        run: jq '.wordErrorRate' ${{ env.TEST_BUILD_FOLDER_PATH }}/${{ env.TEST_SUMMARY_FILE }} | xargs -I {} echo "::set-env name=NEW_WER::{}"
 
       - name: PASS - Update benchmark in configuration file
         if: env.BENCHMARK_BLOB_EXISTS == 'false' || env.BENCHMARK_WER > env.NEW_WER
@@ -405,19 +397,11 @@ jobs:
           echo ${{ env.TEST_SUMMARY_FILE }} > ${{ env.TEST_BUILD_FOLDER_PATH }}/benchmark-test.txt
           az storage blob upload --account-name ${{ secrets.STORAGE_ACCOUNT_NAME }} --container-name configuration --name benchmark-test.txt --file ${{ env.TEST_BUILD_FOLDER_PATH }}/benchmark-test.txt --auth-mode login
 
-      # Set environment variables to be bash variables to avoid substitution
-      # errors. Check that the model has been successfully uploaded with
-      # [[${my_variable//-/} =~ ^[[:xdigit:]]{32}$]] which will return true if
-      # the variable is a valid GUID with 32 hexadecimal characters.
       - name: FAIL - Delete model uploads to Speech
         if: env.BENCHMARK_WER <= env.NEW_WER
         run: |
-          custom_speech_model_id=${{ env.CUSTOM_SPEECH_MODEL_ID }}
-          if [[ ${custom_speech_model_id//-/} =~ ^[[:xdigit:]]{32}$ ]]
-          then
-            speech model delete ${{ env.CUSTOM_SPEECH_MODEL_ID }}
-            echo DELETED CUSTOM SPEECH MODEL.
-          fi
+          speech model delete ${{ env.CUSTOM_SPEECH_MODEL_ID }}
+          echo DELETED CUSTOM SPEECH MODEL.
           echo "::error ::Failed to improve upon the benchmark Custom Speech model. Submit a pull request with updates to training data to try again."
           exit 1
 
@@ -435,7 +419,7 @@ jobs:
     needs: [setup, train_data_update]
 
     steps:
-      - name: Checkout and download LFS dependencies
+      - name: Checkout the repository
         uses: actions/checkout@v2
       #   with:
       #     lfs: true
@@ -458,6 +442,7 @@ jobs:
         uses: gittools/actions/gitversion/setup@6dfe406
         with:
           versionSpec: "5.2.x"
+
       - name: Use GitVersion
         id: gitversion
         uses: gittools/actions/gitversion/execute@6dfe406
